@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "rustaria-core",
+    "rustaria-game",
+]
+resolver = "2"

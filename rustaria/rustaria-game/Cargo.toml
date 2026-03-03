@@ -1,0 +1,17 @@
+[package]
+name = "rustaria-game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustaria-core = { path = "../rustaria-core" }
+
+# Dépendances graphiques — à décommenter quand le code les utilise
+winit = "0.29"
+wgpu = "0.20"
+glam = "0.29"
+bytemuck = "1"
+pollster = "0.3"
+
+log = "0.4"
+env_logger = "0.11"
