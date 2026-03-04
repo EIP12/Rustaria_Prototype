@@ -15,12 +15,12 @@ impl CameraUniform {
     fn new(width: u32, height: u32) -> Self {
         let aspect = width as f32 / height as f32;
 
-        // View : caméra placée en (3, 2, 3) regardant vers (0, 0.5, 0)
-        // Légèrement en hauteur pour voir les 3 faces du cube
+        // View : caméra placée en (8, 18, 28) regardant vers le centre du chunk (8, 2, 8)
+        // Le chunk fait 16x16 en X/Z et 5 blocs de haut (y=0..4)
         let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(3.0, 2.0, 3.0),  // position caméra
-            glam::Vec3::new(0.0, 0.5, 0.0),  // cible
-            glam::Vec3::Y,                    // vecteur "haut"
+            glam::Vec3::new(8.0, 18.0, 28.0), // position caméra (au-dessus et devant)
+            glam::Vec3::new(8.0, 2.0, 8.0),   // cible = centre du chunk
+            glam::Vec3::Y,                     // vecteur "haut"
         );
 
         // Projection perspective, FOV 70°
@@ -73,7 +73,7 @@ pub fn create_pipeline(
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
-) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup) {
     // ── Shader WGSL ──────────────────────────────────────────────────────
     // learn-wgpu tuto 3 : les deux entry points doivent avoir des noms différents
     let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -119,65 +119,67 @@ pub fn create_pipeline(
         push_constant_ranges: &[],
     });
 
-    // ── RenderPipeline : assemble tout ──────────────────────────────────
-    // learn-wgpu tuto 3 : chaque champ est expliqué
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Render Pipeline"),
-        layout: Some(&pipeline_layout),
+    // ── Helper closure pour créer un pipeline avec un polygon_mode donné ──
+    let make_pipeline = |polygon_mode: wgpu::PolygonMode, label: &'static str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[vertex_buffer_layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            // Wireframe = PolygonMode::Line, rendu normal = Fill
+            // Le back-face culling est désactivé en wireframe pour voir toutes les arêtes
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: if polygon_mode == wgpu::PolygonMode::Fill {
+                    Some(wgpu::Face::Back)
+                } else {
+                    None // En wireframe on veut voir toutes les arêtes
+                },
+                polygon_mode,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        })
+    };
 
-        // Vertex shader
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[vertex_buffer_layout()], // layout de notre struct Vertex
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
+    // ── Pipeline normal (rendu rempli) ───────────────────────────────────
+    let fill_pipeline = make_pipeline(wgpu::PolygonMode::Fill, "Fill Pipeline");
 
-        // Fragment shader
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
+    // ── Pipeline wireframe (grille debug, touche G) ──────────────────────
+    // Requiert wgpu::Features::POLYGON_MODE_LINE activé dans renderer.rs
+    let wireframe_pipeline = make_pipeline(wgpu::PolygonMode::Line, "Wireframe Pipeline");
 
-        // Triangles, face avant = sens anti-horaire (CCW), back-face culling activé
-        // learn-wgpu tuto 3 : FrontFace::Ccw correspond à nos indices mesh.rs
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-
-        // Depth buffer : INDISPENSABLE pour le rendu 3D
-        // Sans ça les faces se dessinent dans le mauvais ordre (z-fighting)
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-
-        multiview: None,
-        cache: None,
-    });
-
-    (render_pipeline, camera_bind_group)
+    (fill_pipeline, wireframe_pipeline, camera_bind_group)
 }
 
 // ─────────────────────────────────────────────

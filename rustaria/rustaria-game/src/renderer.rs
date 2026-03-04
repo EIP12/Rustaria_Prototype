@@ -43,7 +43,8 @@ impl Renderer {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Rustaria Device"),
-                    required_features: wgpu::Features::empty(),
+                    // POLYGON_MODE_LINE requis pour le wireframe debug (touche G)
+                    required_features: wgpu::Features::POLYGON_MODE_LINE,
                     required_limits: wgpu::Limits::default(),
                     ..Default::default()
                 },

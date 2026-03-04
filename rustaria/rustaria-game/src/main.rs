@@ -10,6 +10,7 @@ use winit::{
 
 use rustaria_core::{block::BlockRegistry, chunk::ChunkData, mesh::mesh_chunk};
 
+mod debug;
 mod pipeline;
 mod renderer;
 
@@ -73,6 +74,17 @@ impl ApplicationHandler for App {
                 ..
             } => event_loop.exit(),
 
+            // ── G = toggle wireframe (debug grille) ─────────────
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyG),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => state.debug.toggle_wireframe(),
+
             // ── Redimensionnement ───────────────────────────────
             // Obligatoire même si on ne resize pas :
             // wgpu plante si la surface n'est pas reconfigurée
@@ -108,12 +120,16 @@ pub struct GameState {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
 
-    // Pipeline de rendu + caméra
+    // Pipelines de rendu + caméra
     render_pipeline: wgpu::RenderPipeline,
+    wireframe_pipeline: wgpu::RenderPipeline,
     camera_bind_group: wgpu::BindGroup,
 
     // Depth buffer (indispensable pour l'ordre des faces 3D)
     depth_texture_view: wgpu::TextureView,
+
+    // Debugger visuel (touche G = wireframe)
+    debug: debug::DebugOverlay,
 }
 
 impl GameState {
@@ -126,7 +142,7 @@ impl GameState {
         // ── 2. Données depuis rustaria-core ──────────────────────────────
         // On ne touche pas au renderer ici : données pures, aucun GPU
         let registry = BlockRegistry::new();
-        let chunk = ChunkData::generate_single_block_test();
+        let chunk = ChunkData::generate_flat_test();
         let (vertices, indices) = mesh_chunk(&chunk, &registry);
 
         // ── 3. Upload vertex buffer ──────────────────────────────────────
@@ -151,10 +167,9 @@ impl GameState {
                 });
         let num_indices = indices.len() as u32;
 
-        // ── 5. Pipeline + uniform buffer MVP (caméra fixe) ───────────────
-        // La matrice MVP est calculée UNE SEULE FOIS ici, jamais mise à jour
-        // Caméra : (3, 2, 3) → (0, 0, 0), FOV 70°
-        let (render_pipeline, camera_bind_group) = pipeline::create_pipeline(
+        // ── 5. Pipelines + uniform buffer MVP (caméra fixe) ────────────
+        // Retourne fill + wireframe + bind_group
+        let (render_pipeline, wireframe_pipeline, camera_bind_group) = pipeline::create_pipeline(
             &renderer.device,
             renderer.config.format,
             renderer.config.width,
@@ -173,8 +188,10 @@ impl GameState {
             index_buffer,
             num_indices,
             render_pipeline,
+            wireframe_pipeline,
             camera_bind_group,
             depth_texture_view,
+            debug: debug::DebugOverlay::new(),
         }
     }
 
@@ -252,7 +269,13 @@ impl GameState {
                 });
 
             // ── 4. Bind pipeline + ressources ────────────────────────────
-            render_pass.set_pipeline(&self.render_pipeline);
+            // G = wireframe (debug grille), sinon rendu normal
+            let active_pipeline = if self.debug.wireframe {
+                &self.wireframe_pipeline
+            } else {
+                &self.render_pipeline
+            };
+            render_pass.set_pipeline(active_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(
