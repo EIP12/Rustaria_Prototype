@@ -28,16 +28,26 @@ fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 // ─────────────────────────────────────────────
+// PipelineBundle : regroupe tout ce que create_pipeline retourne
+// Évite un tuple de 4 éléments fragile — ajouter un champ ne casse aucun appelant
+// ─────────────────────────────────────────────
+pub struct PipelineBundle {
+    pub fill_pipeline: wgpu::RenderPipeline,
+    pub wireframe_pipeline: wgpu::RenderPipeline,
+    pub camera_bind_group: wgpu::BindGroup,
+    pub camera_buffer: wgpu::Buffer,
+}
+
+// ─────────────────────────────────────────────
 // create_pipeline : pipeline de rendu + bind group caméra + camera buffer
-// Retourne le camera_buffer séparément pour que main.rs puisse appeler
-// camera.upload() dessus à chaque frame (Option B caméra libre)
+// Retourne un PipelineBundle — main.rs déstructure ce qu'il lui faut
 // ─────────────────────────────────────────────
 pub fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer) {
+) -> PipelineBundle {
     // ── Shader WGSL ──────────────────────────────────────────────────────
     // learn-wgpu tuto 3 : les deux entry points doivent avoir des noms différents
     let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -138,7 +148,12 @@ pub fn create_pipeline(
     // Requiert wgpu::Features::POLYGON_MODE_LINE activé dans renderer.rs
     let wireframe_pipeline = make_pipeline(wgpu::PolygonMode::Line, "Wireframe Pipeline");
 
-    (fill_pipeline, wireframe_pipeline, camera_bind_group, camera_buffer)
+    PipelineBundle {
+        fill_pipeline,
+        wireframe_pipeline,
+        camera_bind_group,
+        camera_buffer,
+    }
 }
 
 // ─────────────────────────────────────────────

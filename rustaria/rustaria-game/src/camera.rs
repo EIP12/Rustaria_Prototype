@@ -87,6 +87,32 @@ impl Camera {
         }
     }
 
+    /// Met à jour position + orientation depuis l'InputState du frame courant
+    /// À appeler une fois par frame dans render(), avant upload()
+    pub fn update(&mut self, input: &crate::input::InputState) {
+        const MOVE_SPEED: f32 = 0.15;
+        const MOUSE_SENSITIVITY: f32 = 0.002;
+
+        let forward = self.forward();
+        let right = self.right();
+
+        if input.forward  { self.position += forward * MOVE_SPEED; }
+        if input.backward { self.position -= forward * MOVE_SPEED; }
+        if input.right    { self.position += right   * MOVE_SPEED; }
+        if input.left     { self.position -= right   * MOVE_SPEED; }
+        if input.up       { self.position.y += MOVE_SPEED; }
+        if input.down     { self.position.y -= MOVE_SPEED; }
+
+        if input.mouse_captured {
+            self.yaw   += input.mouse_dx * MOUSE_SENSITIVITY;
+            self.pitch -= input.mouse_dy * MOUSE_SENSITIVITY; // dy inversé : souris haut = regard haut
+            self.pitch  = self.pitch.clamp(
+                f32::to_radians(-89.0),
+                f32::to_radians(89.0),
+            );
+        }
+    }
+
     /// Écrit la view_proj courante dans le GPU uniform buffer
     pub fn upload(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer) {
         let uniform = self.build_uniform();

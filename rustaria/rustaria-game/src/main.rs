@@ -19,6 +19,7 @@ mod renderer;
 use camera::Camera;
 use gpu_mesh::GpuMesh;
 use input::InputState;
+use pipeline::PipelineBundle;
 use renderer::Renderer;
 
 // ─────────────────────────────────────────────
@@ -160,14 +161,18 @@ impl GameState {
         let mesh = GpuMesh::new(&renderer.device, &vertices, &indices);
 
         // ── 5. Pipelines + uniform buffer MVP (caméra libre) ───────────
-        // Retourne fill + wireframe + bind_group + camera_buffer
-        let (render_pipeline, wireframe_pipeline, camera_bind_group, camera_buffer) =
-            pipeline::create_pipeline(
-                &renderer.device,
-                renderer.config.format,
-                renderer.config.width,
-                renderer.config.height,
-            );
+        // Retourne un PipelineBundle (fill + wireframe + bind_group + camera_buffer)
+        let PipelineBundle {
+            fill_pipeline: render_pipeline,
+            wireframe_pipeline,
+            camera_bind_group,
+            camera_buffer,
+        } = pipeline::create_pipeline(
+            &renderer.device,
+            renderer.config.format,
+            renderer.config.width,
+            renderer.config.height,
+        );
 
         // ── 6. Caméra libre ──────────────────────────────────────────────
         let camera = Camera::new(renderer.config.width, renderer.config.height);
@@ -202,34 +207,8 @@ impl GameState {
         }
 
         // ── 0. Mise à jour caméra depuis les inputs ──────────────────────
-        // Vitesse de déplacement et sensibilité souris
-        const MOVE_SPEED: f32 = 0.15;
-        const MOUSE_SENSITIVITY: f32 = 0.002;
-
-        // Déplacement clavier dans le repère de la caméra
-        let forward = self.camera.forward();
-        let right = self.camera.right();
-
-        if self.input.forward  { self.camera.position += forward * MOVE_SPEED; }
-        if self.input.backward { self.camera.position -= forward * MOVE_SPEED; }
-        if self.input.right    { self.camera.position += right   * MOVE_SPEED; }
-        if self.input.left     { self.camera.position -= right   * MOVE_SPEED; }
-        if self.input.up       { self.camera.position.y += MOVE_SPEED; }
-        if self.input.down     { self.camera.position.y -= MOVE_SPEED; }
-
-        // Rotation souris (seulement si capturée)
-        if self.input.mouse_captured {
-            self.camera.yaw   += self.input.mouse_dx * MOUSE_SENSITIVITY;
-            // Inverser dy : mouvement souris vers le haut = regard vers le haut
-            self.camera.pitch -= self.input.mouse_dy * MOUSE_SENSITIVITY;
-            // Clamp pitch à ±89° pour éviter le gimbal lock
-            self.camera.pitch = self.camera.pitch.clamp(
-                f32::to_radians(-89.0),
-                f32::to_radians(89.0),
-            );
-        }
-        // Réinitialiser le delta souris après consommation
-        self.input.mouse_dx = 0.0;
+        self.camera.update(&self.input);
+        self.input.mouse_dx = 0.0; // reset delta souris après consommation
         self.input.mouse_dy = 0.0;
 
         // Upload la nouvelle matrice view_proj au GPU
