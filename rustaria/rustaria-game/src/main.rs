@@ -2,18 +2,23 @@ use std::sync::Arc;
 
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{DeviceEvent, DeviceId, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
 
 use rustaria_core::{block::BlockRegistry, chunk::ChunkData, mesh::mesh_chunk};
 
+mod camera;
 mod debug;
+mod gpu_mesh;
+mod input;
 mod pipeline;
 mod renderer;
 
+use camera::Camera;
+use gpu_mesh::GpuMesh;
+use input::InputState;
 use renderer::Renderer;
 
 // ─────────────────────────────────────────────
@@ -59,31 +64,14 @@ impl ApplicationHandler for App {
             None => return, // Fenêtre pas encore prête → on ignore
         };
 
+        // ── Clavier : délégué à input.rs ───────────────────────────────
+        if input::handle_keyboard(&event, event_loop, &mut state.debug, &mut state.input) {
+            return;
+        }
+
         match event {
             // ── Fermeture ──────────────────────────────────────
             WindowEvent::CloseRequested => event_loop.exit(),
-
-            // ── Échap aussi = fermeture ─────────────────────────
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => event_loop.exit(),
-
-            // ── G = toggle wireframe (debug grille) ─────────────
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyG),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => state.debug.toggle_wireframe(),
 
             // ── Redimensionnement ───────────────────────────────
             // Obligatoire même si on ne resize pas :
@@ -93,6 +81,11 @@ impl ApplicationHandler for App {
                 // Recréer le depth buffer à la nouvelle taille
                 state.depth_texture_view = pipeline::create_depth_texture_view(
                     &state.renderer.device,
+                    state.renderer.config.width,
+                    state.renderer.config.height,
+                );
+                // Mettre à jour l'aspect ratio de la caméra
+                state.camera.resize(
                     state.renderer.config.width,
                     state.renderer.config.height,
                 );
@@ -107,6 +100,19 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    // DeviceEvent : delta souris brut (non filtré par le focus OS)
+    // Nécessaire pour la caméra libre — indépendant de la position du curseur
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let Some(state) = &mut self.state {
+            input::handle_device_event(&event, &mut state.input);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -115,15 +121,20 @@ impl ApplicationHandler for App {
 pub struct GameState {
     renderer: Renderer,
 
-    // Buffers GPU générés depuis rustaria-core
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    // Mesh GPU (vertex + index buffers) généré depuis rustaria-core
+    mesh: GpuMesh,
 
-    // Pipelines de rendu + caméra
+    // Pipelines de rendu
     render_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
+
+    // Caméra libre (Option B)
+    camera: Camera,
+    camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+
+    // État des entrées clavier/souris
+    input: InputState,
 
     // Depth buffer (indispensable pour l'ordre des faces 3D)
     depth_texture_view: wgpu::TextureView,
@@ -145,36 +156,21 @@ impl GameState {
         let chunk = ChunkData::generate_flat_test();
         let (vertices, indices) = mesh_chunk(&chunk, &registry);
 
-        // ── 3. Upload vertex buffer ──────────────────────────────────────
-        use wgpu::util::DeviceExt; // requis pour create_buffer_init
-        let vertex_buffer =
-            renderer
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+        // ── 3. Upload vertex + index buffers (délégué à GpuMesh) ────────
+        let mesh = GpuMesh::new(&renderer.device, &vertices, &indices);
 
-        // ── 4. Upload index buffer ───────────────────────────────────────
-        let index_buffer =
-            renderer
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Index Buffer"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-        let num_indices = indices.len() as u32;
+        // ── 5. Pipelines + uniform buffer MVP (caméra libre) ───────────
+        // Retourne fill + wireframe + bind_group + camera_buffer
+        let (render_pipeline, wireframe_pipeline, camera_bind_group, camera_buffer) =
+            pipeline::create_pipeline(
+                &renderer.device,
+                renderer.config.format,
+                renderer.config.width,
+                renderer.config.height,
+            );
 
-        // ── 5. Pipelines + uniform buffer MVP (caméra fixe) ────────────
-        // Retourne fill + wireframe + bind_group
-        let (render_pipeline, wireframe_pipeline, camera_bind_group) = pipeline::create_pipeline(
-            &renderer.device,
-            renderer.config.format,
-            renderer.config.width,
-            renderer.config.height,
-        );
+        // ── 6. Caméra libre ──────────────────────────────────────────────
+        let camera = Camera::new(renderer.config.width, renderer.config.height);
         // ── 6. Depth buffer ──────────────────────────────────────────────
         let depth_texture_view = pipeline::create_depth_texture_view(
             &renderer.device,
@@ -184,12 +180,13 @@ impl GameState {
 
         Self {
             renderer,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
+            mesh,
             render_pipeline,
             wireframe_pipeline,
+            camera,
+            camera_buffer,
             camera_bind_group,
+            input: InputState::default(),
             depth_texture_view,
             debug: debug::DebugOverlay::new(),
         }
@@ -203,6 +200,40 @@ impl GameState {
         if !self.renderer.is_surface_configured {
             return;
         }
+
+        // ── 0. Mise à jour caméra depuis les inputs ──────────────────────
+        // Vitesse de déplacement et sensibilité souris
+        const MOVE_SPEED: f32 = 0.15;
+        const MOUSE_SENSITIVITY: f32 = 0.002;
+
+        // Déplacement clavier dans le repère de la caméra
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+
+        if self.input.forward  { self.camera.position += forward * MOVE_SPEED; }
+        if self.input.backward { self.camera.position -= forward * MOVE_SPEED; }
+        if self.input.right    { self.camera.position += right   * MOVE_SPEED; }
+        if self.input.left     { self.camera.position -= right   * MOVE_SPEED; }
+        if self.input.up       { self.camera.position.y += MOVE_SPEED; }
+        if self.input.down     { self.camera.position.y -= MOVE_SPEED; }
+
+        // Rotation souris (seulement si capturée)
+        if self.input.mouse_captured {
+            self.camera.yaw   += self.input.mouse_dx * MOUSE_SENSITIVITY;
+            // Inverser dy : mouvement souris vers le haut = regard vers le haut
+            self.camera.pitch -= self.input.mouse_dy * MOUSE_SENSITIVITY;
+            // Clamp pitch à ±89° pour éviter le gimbal lock
+            self.camera.pitch = self.camera.pitch.clamp(
+                f32::to_radians(-89.0),
+                f32::to_radians(89.0),
+            );
+        }
+        // Réinitialiser le delta souris après consommation
+        self.input.mouse_dx = 0.0;
+        self.input.mouse_dy = 0.0;
+
+        // Upload la nouvelle matrice view_proj au GPU
+        self.camera.upload(&self.renderer.queue, &self.camera_buffer);
 
         // ── 1. Texture courante (le backbuffer) ──────────────────────────
         let output = match self.renderer.surface.get_current_texture() {
@@ -277,14 +308,14 @@ impl GameState {
             };
             render_pass.set_pipeline(active_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
             render_pass.set_index_buffer(
-                self.index_buffer.slice(..),
+                self.mesh.index_buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
 
             // ── 5. Draw ──────────────────────────────────────────────────
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.draw_indexed(0..self.mesh.num_indices, 0, 0..1);
 
         } // ← drop(render_pass) ici, libère le borrow sur encoder
 

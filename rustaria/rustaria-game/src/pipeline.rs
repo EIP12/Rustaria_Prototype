@@ -1,41 +1,4 @@
-use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
-
-// ─────────────────────────────────────────────
-// Uniform caméra : la matrice view_proj envoyée au vertex shader
-// Caméra FIXE pour l'alpha : calculée une seule fois, jamais mise à jour
-// ─────────────────────────────────────────────
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct CameraUniform {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new(width: u32, height: u32) -> Self {
-        let aspect = width as f32 / height as f32;
-
-        // View : caméra placée en (8, 18, 28) regardant vers le centre du chunk (8, 2, 8)
-        // Le chunk fait 16x16 en X/Z et 5 blocs de haut (y=0..4)
-        let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(8.0, 18.0, 28.0), // position caméra (au-dessus et devant)
-            glam::Vec3::new(8.0, 2.0, 8.0),   // cible = centre du chunk
-            glam::Vec3::Y,                     // vecteur "haut"
-        );
-
-        // Projection perspective, FOV 70°
-        let proj = glam::Mat4::perspective_rh(
-            f32::to_radians(70.0), // fov vertical
-            aspect,
-            0.1,   // near plane
-            100.0, // far plane
-        );
-
-        Self {
-            view_proj: (proj * view).to_cols_array_2d(),
-        }
-    }
-}
+use crate::camera;
 
 // ─────────────────────────────────────────────
 // Layout du vertex buffer
@@ -65,26 +28,22 @@ fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 // ─────────────────────────────────────────────
-// create_pipeline : pipeline de rendu + bind group caméra
-// Retourne les deux car main.rs a besoin des deux séparément
+// create_pipeline : pipeline de rendu + bind group caméra + camera buffer
+// Retourne le camera_buffer séparément pour que main.rs puisse appeler
+// camera.upload() dessus à chaque frame (Option B caméra libre)
 // ─────────────────────────────────────────────
 pub fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup) {
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer) {
     // ── Shader WGSL ──────────────────────────────────────────────────────
     // learn-wgpu tuto 3 : les deux entry points doivent avoir des noms différents
     let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-    // ── Uniform buffer caméra (MVP fixe) ────────────────────────────────
-    let camera_uniform = CameraUniform::new(width, height);
-    let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Camera Buffer"),
-        contents: bytemuck::cast_slice(&[camera_uniform]),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
+    // ── Uniform buffer caméra (MVP fixe) — délégué à camera.rs ─────────
+    let camera_buffer = camera::build_camera_buffer(device, width, height);
 
     // ── Bind group layout : décrit ce que le shader attend en @group(0) ─
     let camera_bind_group_layout =
@@ -179,7 +138,7 @@ pub fn create_pipeline(
     // Requiert wgpu::Features::POLYGON_MODE_LINE activé dans renderer.rs
     let wireframe_pipeline = make_pipeline(wgpu::PolygonMode::Line, "Wireframe Pipeline");
 
-    (fill_pipeline, wireframe_pipeline, camera_bind_group)
+    (fill_pipeline, wireframe_pipeline, camera_bind_group, camera_buffer)
 }
 
 // ─────────────────────────────────────────────
