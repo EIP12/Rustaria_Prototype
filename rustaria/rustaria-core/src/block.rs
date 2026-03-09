@@ -42,11 +42,7 @@ pub struct BlockRegistry { blocks: Vec<BlockType> }
 impl BlockRegistry {
     pub fn new() -> Self {
         let mut r = Self { blocks: Vec::new() };
-        // Enregistrement dans l'ordre — AIR doit être index 0
-        r.register(BlockType { id: BlockId::AIR,   name: "Air",   color: BlockColor { r:0.0, g:0.0, b:0.0 }, solid: false });
-        r.register(BlockType { id: BlockId::STONE,  name: "Stone", color: BlockColor { r:0.5, g:0.5, b:0.5 }, solid: true  });
-        r.register(BlockType { id: BlockId::DIRT,   name: "Dirt",  color: BlockColor { r:0.6, g:0.4, b:0.2 }, solid: true  });
-        r.register(BlockType { id: BlockId::GRASS,  name: "Grass", color: BlockColor { r:0.2, g:0.7, b:0.2 }, solid: true  });
+        crate::blocks::defaults::register_defaults(&mut r);
         r
     }
 
