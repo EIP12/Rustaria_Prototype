@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytemuck;
 use winit::{
@@ -115,6 +116,7 @@ pub struct GameState {
     camera_bind_group: wgpu::BindGroup,
 
     day_time: f32,
+    is_night: bool,
     light_buffer: wgpu::Buffer,
 
     input: InputState,
@@ -134,7 +136,12 @@ impl GameState {
         let renderer = Renderer::new(window).await;
 
         let registry = BlockRegistry::new();
-        let world = WorldManager::new(42);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        log::info!("World seed: {}", seed);
+        let world = WorldManager::new(seed);
 
         // Build list of all chunk positions to load, sorted by distance to camera
         let cam_cx = (128.0 / CHUNK_SIZE as f32) as i32;
@@ -185,7 +192,8 @@ impl GameState {
             camera,
             camera_buffer,
             camera_bind_group,
-            day_time: 0.1,
+            day_time: 0.25, // start at noon
+            is_night: false,
             light_buffer,
             input: InputState::default(),
             depth_texture_view,
@@ -259,12 +267,46 @@ impl GameState {
         // Progressive chunk loading
         self.load_chunks();
 
+        // Toggle day/night on L
+        if self.input.toggle_light {
+            self.input.toggle_light = false;
+            self.is_night = !self.is_night;
+            self.day_time = if self.is_night { 0.75 } else { 0.25 };
+        }
+
+        // Regenerate world on R
+        if self.input.regen_world {
+            self.input.regen_world = false;
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            log::info!("Regenerating world with seed: {}", seed);
+            self.world = WorldManager::new(seed);
+            self.gpu_meshes.clear();
+            let cam_cx = (128.0 / CHUNK_SIZE as f32) as i32;
+            let cam_cy = (60.0  / CHUNK_SIZE as f32) as i32;
+            let cam_cz = (128.0 / CHUNK_SIZE as f32) as i32;
+            self.pending_chunks.clear();
+            for cy in 0..WORLD_CY {
+                for cz in 0..WORLD_CZ {
+                    for cx in 0..WORLD_CX {
+                        self.pending_chunks.push((cx, cy, cz));
+                    }
+                }
+            }
+            self.pending_chunks.sort_by(|a, b| {
+                let da = (a.0-cam_cx).pow(2) + (a.1-cam_cy).pow(2) + (a.2-cam_cz).pow(2);
+                let db = (b.0-cam_cx).pow(2) + (b.1-cam_cy).pow(2) + (b.2-cam_cz).pow(2);
+                db.cmp(&da)
+            });
+        }
+
         self.camera.update(&self.input);
         self.input.mouse_dx = 0.0;
         self.input.mouse_dy = 0.0;
         self.camera.upload(&self.renderer.queue, &self.camera_buffer);
 
-        self.day_time = (self.day_time + 0.00083) % 1.0;
         let light_data = pipeline::day_night_light(self.day_time);
         self.renderer.queue.write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&light_data));
 

@@ -19,19 +19,31 @@ impl TerrainGenerator {
         let scale1 = 0.02;
         let scale2 = 0.05;
         let scale3 = 0.1;
+        let continent_scale = 0.005;
 
         let x = world_x as f64;
         let z = world_z as f64;
 
-        // 3 octaves of Perlin noise
+        // Low-frequency continent mask: determines plains vs mountains regions
+        // Offset coordinates to sample different noise values than the detail layers
+        let continent = (self.perlin.get([x * continent_scale + 500.0, z * continent_scale + 500.0]) + 1.0) / 2.0; // 0..1
+
+        // 3 octaves of detail noise
         let n1 = self.perlin.get([x * scale1, z * scale1]);
         let n2 = self.perlin.get([x * scale2, z * scale2]) * 0.5;
         let n3 = self.perlin.get([x * scale3, z * scale3]) * 0.25;
 
-        let combined = (n1 + n2 + n3) / 1.75; // normalize to roughly -1..1
+        let combined = (n1 + n2 + n3) / 1.75; // roughly -1..1
         let normalized = (combined + 1.0) / 2.0; // 0..1
 
-        (normalized * 48.0) as i32
+        // Plains: low flat terrain (~8..14). Mountains: full range (~0..48).
+        // continent < 0.4 → plains, continent > 0.6 → mountains, smooth blend in between.
+        let continent_blend = ((continent - 0.4) / 0.2).clamp(0.0, 1.0);
+        let plain_height = 0.15 + normalized * 0.08; // 0.15..0.23
+        let mountain_height = normalized;              // 0.0..1.0
+        let blended = plain_height + (mountain_height - plain_height) * continent_blend;
+
+        (blended * 48.0) as i32
     }
 
     /// Generate a chunk at the given chunk coordinates (cx, cy, cz).
