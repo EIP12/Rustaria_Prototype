@@ -3,35 +3,21 @@ use bytemuck::{Pod, Zeroable};
 use crate::block::BlockRegistry;
 use crate::chunk::{ChunkData, CHUNK_SIZE};
 
-// ─────────────────────────────────────────────
-// Vertex : position + couleur
-// Pod + Zeroable = bytemuck peut le caster directement en &[u8] pour le GPU
-// ─────────────────────────────────────────────
+/// Vertex envoyé au GPU — correspond au `VertexInput` du shader WGSL (40 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
-    pub color: [f32; 3],
+    pub color:    [f32; 3],
+    pub normal:   [f32; 3],
+    pub ao:       f32,
 }
 
-// ─────────────────────────────────────────────
-// Les 6 faces d'un cube, chacune = 4 vertices + 2 triangles
-// Ordre : +X, -X, +Y, -Y, +Z, -Z
-// ─────────────────────────────────────────────
-//
-// Multiplicateurs de luminosité par face :
-//   Dessus (+Y)  : x1.0  (la plus claire)
-//   Côtés        : x0.75
-//   Dessous (-Y) : x0.5  (la plus sombre)
-// → Permet de distinguer les faces sans shader d'éclairage
-
+/// Définition d'une face de cube : voisin à tester, 4 coins et normale.
 struct FaceDef {
-    // direction du voisin à vérifier (si air → on ajoute la face)
     neighbor: (i32, i32, i32),
-    // 4 coins du quad dans le repère local du bloc
-    corners: [[f32; 3]; 4],
-    // multiplicateur de lumière
-    light: f32,
+    corners:  [[f32; 3]; 4],
+    normal:   [f32; 3],
 }
 
 const FACES: [FaceDef; 6] = [
@@ -44,7 +30,7 @@ const FACES: [FaceDef; 6] = [
             [1.0, 1.0, 1.0],
             [1.0, 0.0, 1.0],
         ],
-        light: 0.75,
+        normal: [1.0, 0.0, 0.0],
     },
     // -X (gauche)
     FaceDef {
@@ -55,7 +41,7 @@ const FACES: [FaceDef; 6] = [
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0],
         ],
-        light: 0.75,
+        normal: [-1.0, 0.0, 0.0],
     },
     // +Y (dessus)
     FaceDef {
@@ -66,7 +52,7 @@ const FACES: [FaceDef; 6] = [
             [1.0, 1.0, 1.0],
             [1.0, 1.0, 0.0],
         ],
-        light: 1.0,
+        normal: [0.0, 1.0, 0.0],
     },
     // -Y (dessous)
     FaceDef {
@@ -77,7 +63,7 @@ const FACES: [FaceDef; 6] = [
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 1.0],
         ],
-        light: 0.5,
+        normal: [0.0, -1.0, 0.0],
     },
     // +Z (avant)
     FaceDef {
@@ -88,7 +74,7 @@ const FACES: [FaceDef; 6] = [
             [1.0, 1.0, 1.0],
             [0.0, 1.0, 1.0],
         ],
-        light: 0.75,
+        normal: [0.0, 0.0, 1.0],
     },
     // -Z (arrière)
     FaceDef {
@@ -99,100 +85,57 @@ const FACES: [FaceDef; 6] = [
             [0.0, 1.0, 0.0],
             [1.0, 1.0, 0.0],
         ],
-        light: 0.75,
+        normal: [0.0, 0.0, -1.0],
     },
 ];
 
-// ─────────────────────────────────────────────
-// mesh_chunk : transforme les données du chunk en triangles pour le GPU
-//
-// Algorithme :
-//   Pour chaque bloc non-air du chunk
-//     Pour chacune de ses 6 faces
-//       Si le voisin dans cette direction est de l'air (ou hors chunk)
-//         → ajouter un quad (4 vertices, 2 triangles = 6 indices)
-//
-// Signature stable : ne changera pas quand on passera au greedy meshing
-// ─────────────────────────────────────────────
+/// Transforme les données d'un chunk en triangles prêts pour le GPU.
+/// Algorithme : pour chaque bloc non-air, ajoute les faces dont le voisin est de l'air.
 pub fn mesh_chunk(chunk: &ChunkData, registry: &BlockRegistry) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices: Vec<Vertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
+    let mut indices:  Vec<u32>    = Vec::new();
 
     for z in 0..CHUNK_SIZE {
         for y in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let block_id = chunk.get(x, y, z);
+                if block_id.is_air() { continue; }
 
-                // Bloc air → rien à rendre
-                if block_id.is_air() {
-                    continue;
-                }
-
-                // Récupère la couleur de base depuis le registry
-                let base_color = match registry.get(block_id) {
+                let color = match registry.get(block_id) {
                     Some(bt) => [bt.color.r, bt.color.g, bt.color.b],
-                    None => [1.0, 0.0, 1.0], // magenta = bloc inconnu, debug visible
+                    None     => [1.0, 0.0, 1.0], // magenta = bloc inconnu
                 };
 
                 for face in &FACES {
-                    // Coordonnées du voisin dans cette direction
-                    let nx = x as i32 + face.neighbor.0;
-                    let ny = y as i32 + face.neighbor.1;
-                    let nz = z as i32 + face.neighbor.2;
+                    let (nx, ny, nz) = (
+                        x as i32 + face.neighbor.0,
+                        y as i32 + face.neighbor.1,
+                        z as i32 + face.neighbor.2,
+                    );
 
-                    // Voisin hors chunk → on considère que c'est de l'air
-                    // (pour l'alpha avec un seul bloc c'est toujours le cas)
-                    let neighbor_is_air = if nx < 0
-                        || ny < 0
-                        || nz < 0
-                        || nx >= CHUNK_SIZE as i32
-                        || ny >= CHUNK_SIZE as i32
-                        || nz >= CHUNK_SIZE as i32
-                    {
-                        true
-                    } else {
-                        chunk.get(nx as usize, ny as usize, nz as usize).is_air()
-                    };
+                    let in_bounds = nx >= 0 && ny >= 0 && nz >= 0
+                        && nx < CHUNK_SIZE as i32
+                        && ny < CHUNK_SIZE as i32
+                        && nz < CHUNK_SIZE as i32;
 
-                    if !neighbor_is_air {
-                        continue; // Face cachée → on ne l'ajoute pas
-                    }
+                    let neighbor_is_air = !in_bounds
+                        || chunk.get(nx as usize, ny as usize, nz as usize).is_air();
 
-                    // Applique le multiplicateur de luminosité (faux éclairage)
-                    let color = [
-                        base_color[0] * face.light,
-                        base_color[1] * face.light,
-                        base_color[2] * face.light,
-                    ];
+                    if !neighbor_is_air { continue; }
 
-                    // Index du premier vertex de ce quad dans le Vec
-                    let base_index = vertices.len() as u32;
+                    let base = vertices.len() as u32;
 
-                    // 4 vertices du quad (position = coin + offset du bloc dans le chunk)
                     for corner in &face.corners {
                         vertices.push(Vertex {
-                            position: [
-                                x as f32 + corner[0],
-                                y as f32 + corner[1],
-                                z as f32 + corner[2],
-                            ],
+                            position: [x as f32 + corner[0], y as f32 + corner[1], z as f32 + corner[2]],
                             color,
+                            normal: face.normal,
+                            ao: 1.0,
                         });
                     }
 
-                    // 2 triangles = 6 indices (sens anti-horaire = front face CCW)
-                    //   0──1
-                    //   │\ │
-                    //   │ \│
-                    //   3──2
-                    indices.extend_from_slice(&[
-                        base_index,
-                        base_index + 1,
-                        base_index + 2,
-                        base_index,
-                        base_index + 2,
-                        base_index + 3,
-                    ]);
+                    // Quad → 2 triangles (CCW)
+                    indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
                 }
             }
         }
