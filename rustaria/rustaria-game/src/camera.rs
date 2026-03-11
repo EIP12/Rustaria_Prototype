@@ -40,15 +40,15 @@ impl Camera {
     /// Crée la caméra avec une position et une orientation initiales
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            // Position initiale : au-dessus et devant le chunk, regard vers le centre
-            position: glam::Vec3::new(8.0, 18.0, 28.0),
-            yaw: f32::to_radians(180.0), // regarde vers -Z (vers le chunk)
-            pitch: f32::to_radians(-30.0), // légèrement incliné vers le bas
+            // Position initiale : centre du monde (16*16/2=128), au-dessus du terrain
+            position: glam::Vec3::new(128.0, 60.0, 128.0),
+            yaw: f32::to_radians(180.0),
+            pitch: f32::to_radians(-20.0),
 
             aspect: width as f32 / height as f32,
             fov_y: f32::to_radians(70.0),
             near: 0.1,
-            far: 100.0,
+            far: 512.0,
         }
     }
 
@@ -90,7 +90,7 @@ impl Camera {
     /// Met à jour position + orientation depuis l'InputState du frame courant
     /// À appeler une fois par frame dans render(), avant upload()
     pub fn update(&mut self, input: &crate::input::InputState) {
-        const MOVE_SPEED: f32 = 0.15;
+        const MOVE_SPEED: f32 = 0.6;
         const MOUSE_SENSITIVITY: f32 = 0.002;
 
         let forward = self.forward();

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck;
@@ -8,7 +9,12 @@ use winit::{
     window::Window,
 };
 
-use rustaria_core::{block::BlockRegistry, chunk::ChunkData, mesh::mesh_chunk};
+use rustaria_core::{
+    block::BlockRegistry,
+    chunk::CHUNK_SIZE,
+    mesh::{self, ChunkNeighbors},
+    world_manager::WorldManager,
+};
 
 mod camera;
 mod debug;
@@ -22,6 +28,14 @@ use gpu_mesh::GpuMesh;
 use input::InputState;
 use pipeline::PipelineBundle;
 use renderer::Renderer;
+
+// World bounds: 16x4x16 chunks
+const WORLD_CX: i32 = 16;
+const WORLD_CY: i32 = 4;
+const WORLD_CZ: i32 = 16;
+
+// How many chunks to generate + mesh per frame
+const CHUNKS_PER_FRAME: usize = 4;
 
 #[derive(Default)]
 pub struct App {
@@ -88,11 +102,10 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Toutes les ressources GPU + données moteur.
 pub struct GameState {
     renderer: Renderer,
 
-    mesh: GpuMesh,
+    gpu_meshes: HashMap<(i32, i32, i32), GpuMesh>,
 
     render_pipeline: wgpu::RenderPipeline,
     wireframe_pipeline: wgpu::RenderPipeline,
@@ -109,6 +122,11 @@ pub struct GameState {
     depth_texture_view: wgpu::TextureView,
 
     debug: debug::DebugOverlay,
+
+    // World state
+    world: WorldManager,
+    registry: BlockRegistry,
+    pending_chunks: Vec<(i32, i32, i32)>,
 }
 
 impl GameState {
@@ -116,10 +134,28 @@ impl GameState {
         let renderer = Renderer::new(window).await;
 
         let registry = BlockRegistry::new();
-        let chunk = ChunkData::generate_flat_test();
-        let (vertices, indices) = mesh_chunk(&chunk, &registry);
+        let world = WorldManager::new(42);
 
-        let mesh = GpuMesh::new(&renderer.device, &vertices, &indices);
+        // Build list of all chunk positions to load, sorted by distance to camera
+        let cam_cx = (128.0 / CHUNK_SIZE as f32) as i32;
+        let cam_cy = (60.0 / CHUNK_SIZE as f32) as i32;
+        let cam_cz = (128.0 / CHUNK_SIZE as f32) as i32;
+
+        let mut pending_chunks: Vec<(i32, i32, i32)> = Vec::new();
+        for cy in 0..WORLD_CY {
+            for cz in 0..WORLD_CZ {
+                for cx in 0..WORLD_CX {
+                    pending_chunks.push((cx, cy, cz));
+                }
+            }
+        }
+
+        // Sort farthest-first so pop() yields closest chunks first
+        pending_chunks.sort_by(|a, b| {
+            let dist_a = (a.0 - cam_cx).pow(2) + (a.1 - cam_cy).pow(2) + (a.2 - cam_cz).pow(2);
+            let dist_b = (b.0 - cam_cx).pow(2) + (b.1 - cam_cy).pow(2) + (b.2 - cam_cz).pow(2);
+            dist_b.cmp(&dist_a)
+        });
 
         let PipelineBundle {
             fill_pipeline: render_pipeline,
@@ -143,7 +179,7 @@ impl GameState {
 
         Self {
             renderer,
-            mesh,
+            gpu_meshes: HashMap::new(),
             render_pipeline,
             wireframe_pipeline,
             camera,
@@ -154,7 +190,63 @@ impl GameState {
             input: InputState::default(),
             depth_texture_view,
             debug: debug::DebugOverlay::new(),
+            world,
+            registry,
+            pending_chunks,
         }
+    }
+
+    /// Generate N chunks per frame and mesh them + re-mesh dirty neighbors.
+    fn load_chunks(&mut self) {
+        let mut chunks_to_mesh: Vec<(i32, i32, i32)> = Vec::new();
+
+        // Generate up to CHUNKS_PER_FRAME new chunks
+        for _ in 0..CHUNKS_PER_FRAME {
+            let Some(pos) = self.pending_chunks.pop() else { break };
+            let dirty_neighbors = self.world.generate_chunk(pos.0, pos.1, pos.2);
+            chunks_to_mesh.push(pos);
+            // Also re-mesh neighbors that were affected
+            for npos in dirty_neighbors {
+                if !chunks_to_mesh.contains(&npos) {
+                    chunks_to_mesh.push(npos);
+                }
+            }
+        }
+
+        // Also find already-loaded chunks that are dirty (from previous neighbor insertions)
+        // but limit the scan to avoid doing too much per frame
+        // (dirty neighbors from generate_chunk are already in chunks_to_mesh)
+
+        // Mesh all chunks that need it
+        for pos in chunks_to_mesh {
+            self.mesh_and_upload(pos.0, pos.1, pos.2);
+        }
+    }
+
+    fn mesh_and_upload(&mut self, cx: i32, cy: i32, cz: i32) {
+        let chunk = match self.world.get_chunk(cx, cy, cz) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let neighbors = ChunkNeighbors {
+            pos_x: self.world.get_chunk(cx + 1, cy, cz),
+            neg_x: self.world.get_chunk(cx - 1, cy, cz),
+            pos_y: self.world.get_chunk(cx, cy + 1, cz),
+            neg_y: self.world.get_chunk(cx, cy - 1, cz),
+            pos_z: self.world.get_chunk(cx, cy, cz + 1),
+            neg_z: self.world.get_chunk(cx, cy, cz - 1),
+        };
+
+        let (vertices, indices) = mesh::mesh_chunk(chunk, &self.registry, &neighbors);
+
+        if indices.is_empty() {
+            self.gpu_meshes.remove(&(cx, cy, cz));
+            return;
+        }
+
+        let gpu_mesh = GpuMesh::new(&self.renderer.device, &vertices, &indices);
+        self.gpu_meshes.insert((cx, cy, cz), gpu_mesh);
     }
 
     fn render(&mut self) {
@@ -163,6 +255,9 @@ impl GameState {
         if !self.renderer.is_surface_configured {
             return;
         }
+
+        // Progressive chunk loading
+        self.load_chunks();
 
         self.camera.update(&self.input);
         self.input.mouse_dx = 0.0;
@@ -216,9 +311,12 @@ impl GameState {
             let pipeline = if self.debug.wireframe { &self.wireframe_pipeline } else { &self.render_pipeline };
             rp.set_pipeline(pipeline);
             rp.set_bind_group(0, &self.camera_bind_group, &[]);
-            rp.set_vertex_buffer(0, self.mesh.vertex_buffer.slice(..));
-            rp.set_index_buffer(self.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..self.mesh.num_indices, 0, 0..1);
+
+            for mesh in self.gpu_meshes.values() {
+                rp.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rp.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
         }
 
         self.renderer.queue.submit(std::iter::once(encoder.finish()));
