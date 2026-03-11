@@ -1,0 +1,21 @@
+# Artefacts de compilation Cargo
+/target/
+**/target/
+
+# Fichiers de lock (optionnel pour les librairies, à conserver pour les binaires)
+Cargo.lock
+
+# Fichiers d'environnement
+.env
+.env.*
+
+# Éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Système
+.DS_Store
+Thumbs.db

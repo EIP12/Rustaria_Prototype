@@ -1,0 +1,15 @@
+[package]
+name = "rustaria-game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustaria-core = { path = "../rustaria-core" }
+
+winit    = "0.30"       # 0.29 → 0.30 : nouveau pattern ApplicationHandler
+wgpu     = "22"         # 0.20 trop vieux, API incompatible avec notre code
+glam     = "0.29"
+bytemuck = { version = "1", features = ["derive"] }  # "derive" obligatoire pour Pod/Zeroable
+pollster = "0.3"
+log      = "0.4"
+env_logger = "0.11"
