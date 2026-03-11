@@ -28,6 +28,10 @@ pub struct InputState {
 
     // La souris est capturée (clic gauche dans la fenêtre)
     pub mouse_captured: bool,
+
+    // One-shot flags consumed each frame in main.rs
+    pub toggle_light: bool,
+    pub regen_world:  bool,
 }
 
 // ─────────────────────────────────────────────
@@ -82,6 +86,34 @@ pub fn handle_keyboard(
             ..
         } => {
             debug.toggle_wireframe();
+            true
+        }
+
+        // ── L = toggle day / night ───────────────────────────────────────
+        WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::KeyL),
+                    state: ElementState::Pressed,
+                    ..
+                },
+            ..
+        } => {
+            input.toggle_light = true;
+            true
+        }
+
+        // ── R = regenerate world ─────────────────────────────────────────
+        WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::KeyR),
+                    state: ElementState::Pressed,
+                    ..
+                },
+            ..
+        } => {
+            input.regen_world = true;
             true
         }
 

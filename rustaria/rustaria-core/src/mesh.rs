@@ -3,7 +3,6 @@ use bytemuck::{Pod, Zeroable};
 use crate::block::BlockRegistry;
 use crate::chunk::{ChunkData, CHUNK_SIZE};
 
-/// Vertex envoyé au GPU — correspond au `VertexInput` du shader WGSL (40 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
@@ -13,7 +12,27 @@ pub struct Vertex {
     pub ao:       f32,
 }
 
-/// Définition d'une face de cube : voisin à tester, 4 coins et normale.
+/// Optional neighbor chunk data for the 6 faces.
+/// Used for inter-chunk hidden-face culling.
+pub struct ChunkNeighbors<'a> {
+    pub pos_x: Option<&'a ChunkData>, // +X neighbor
+    pub neg_x: Option<&'a ChunkData>, // -X neighbor
+    pub pos_y: Option<&'a ChunkData>, // +Y neighbor
+    pub neg_y: Option<&'a ChunkData>, // -Y neighbor
+    pub pos_z: Option<&'a ChunkData>, // +Z neighbor
+    pub neg_z: Option<&'a ChunkData>, // -Z neighbor
+}
+
+impl<'a> ChunkNeighbors<'a> {
+    pub fn empty() -> Self {
+        Self {
+            pos_x: None, neg_x: None,
+            pos_y: None, neg_y: None,
+            pos_z: None, neg_z: None,
+        }
+    }
+}
+
 struct FaceDef {
     neighbor: (i32, i32, i32),
     corners:  [[f32; 3]; 4],
@@ -21,7 +40,7 @@ struct FaceDef {
 }
 
 const FACES: [FaceDef; 6] = [
-    // +X (droite)
+    // +X
     FaceDef {
         neighbor: (1, 0, 0),
         corners: [
@@ -32,7 +51,7 @@ const FACES: [FaceDef; 6] = [
         ],
         normal: [1.0, 0.0, 0.0],
     },
-    // -X (gauche)
+    // -X
     FaceDef {
         neighbor: (-1, 0, 0),
         corners: [
@@ -43,7 +62,7 @@ const FACES: [FaceDef; 6] = [
         ],
         normal: [-1.0, 0.0, 0.0],
     },
-    // +Y (dessus)
+    // +Y
     FaceDef {
         neighbor: (0, 1, 0),
         corners: [
@@ -54,7 +73,7 @@ const FACES: [FaceDef; 6] = [
         ],
         normal: [0.0, 1.0, 0.0],
     },
-    // -Y (dessous)
+    // -Y
     FaceDef {
         neighbor: (0, -1, 0),
         corners: [
@@ -65,7 +84,7 @@ const FACES: [FaceDef; 6] = [
         ],
         normal: [0.0, -1.0, 0.0],
     },
-    // +Z (avant)
+    // +Z
     FaceDef {
         neighbor: (0, 0, 1),
         corners: [
@@ -76,7 +95,7 @@ const FACES: [FaceDef; 6] = [
         ],
         normal: [0.0, 0.0, 1.0],
     },
-    // -Z (arrière)
+    // -Z
     FaceDef {
         neighbor: (0, 0, -1),
         corners: [
@@ -89,11 +108,31 @@ const FACES: [FaceDef; 6] = [
     },
 ];
 
-/// Transforme les données d'un chunk en triangles prêts pour le GPU.
-/// Algorithme : pour chaque bloc non-air, ajoute les faces dont le voisin est de l'air.
-pub fn mesh_chunk(chunk: &ChunkData, registry: &BlockRegistry) -> (Vec<Vertex>, Vec<u32>) {
+/// Index into ChunkNeighbors by face direction
+fn get_neighbor_for_face<'a>(neighbors: &'a ChunkNeighbors, face_idx: usize) -> Option<&'a ChunkData> {
+    match face_idx {
+        0 => neighbors.pos_x,
+        1 => neighbors.neg_x,
+        2 => neighbors.pos_y,
+        3 => neighbors.neg_y,
+        4 => neighbors.pos_z,
+        5 => neighbors.neg_z,
+        _ => None,
+    }
+}
+
+pub fn mesh_chunk(
+    chunk: &ChunkData,
+    registry: &BlockRegistry,
+    neighbors: &ChunkNeighbors,
+) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut indices:  Vec<u32>    = Vec::new();
+
+    let (cx, cy, cz) = chunk.position;
+    let offset_x = cx as f32 * CHUNK_SIZE as f32;
+    let offset_y = cy as f32 * CHUNK_SIZE as f32;
+    let offset_z = cz as f32 * CHUNK_SIZE as f32;
 
     for z in 0..CHUNK_SIZE {
         for y in 0..CHUNK_SIZE {
@@ -103,23 +142,36 @@ pub fn mesh_chunk(chunk: &ChunkData, registry: &BlockRegistry) -> (Vec<Vertex>, 
 
                 let color = match registry.get(block_id) {
                     Some(bt) => [bt.color.r, bt.color.g, bt.color.b],
-                    None     => [1.0, 0.0, 1.0], // magenta = bloc inconnu
+                    None     => [1.0, 0.0, 1.0],
                 };
 
-                for face in &FACES {
+                for (face_idx, face) in FACES.iter().enumerate() {
                     let (nx, ny, nz) = (
                         x as i32 + face.neighbor.0,
                         y as i32 + face.neighbor.1,
                         z as i32 + face.neighbor.2,
                     );
 
-                    let in_bounds = nx >= 0 && ny >= 0 && nz >= 0
+                    let neighbor_is_air = if nx >= 0 && ny >= 0 && nz >= 0
                         && nx < CHUNK_SIZE as i32
                         && ny < CHUNK_SIZE as i32
-                        && nz < CHUNK_SIZE as i32;
-
-                    let neighbor_is_air = !in_bounds
-                        || chunk.get(nx as usize, ny as usize, nz as usize).is_air();
+                        && nz < CHUNK_SIZE as i32
+                    {
+                        // Inside same chunk
+                        chunk.get(nx as usize, ny as usize, nz as usize).is_air()
+                    } else {
+                        // At chunk boundary — check neighbor chunk
+                        match get_neighbor_for_face(neighbors, face_idx) {
+                            Some(neighbor_chunk) => {
+                                // Wrap coordinate to neighbor's local space
+                                let lx = nx.rem_euclid(CHUNK_SIZE as i32) as usize;
+                                let ly = ny.rem_euclid(CHUNK_SIZE as i32) as usize;
+                                let lz = nz.rem_euclid(CHUNK_SIZE as i32) as usize;
+                                neighbor_chunk.get(lx, ly, lz).is_air()
+                            }
+                            None => true, // No neighbor loaded — emit face (safe default)
+                        }
+                    };
 
                     if !neighbor_is_air { continue; }
 
@@ -127,14 +179,17 @@ pub fn mesh_chunk(chunk: &ChunkData, registry: &BlockRegistry) -> (Vec<Vertex>, 
 
                     for corner in &face.corners {
                         vertices.push(Vertex {
-                            position: [x as f32 + corner[0], y as f32 + corner[1], z as f32 + corner[2]],
+                            position: [
+                                offset_x + x as f32 + corner[0],
+                                offset_y + y as f32 + corner[1],
+                                offset_z + z as f32 + corner[2],
+                            ],
                             color,
                             normal: face.normal,
                             ao: 1.0,
                         });
                     }
 
-                    // Quad → 2 triangles (CCW)
                     indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
                 }
             }
