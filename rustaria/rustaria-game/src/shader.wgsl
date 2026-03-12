@@ -45,3 +45,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let final_color = in.color * light_total * in.ao;
     return vec4<f32>(final_color, 1.0);
 }
+
+// Unlit fragment shader — used for debug overlays (chunk borders, etc.)
+@fragment
+fn fs_unlit(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
+}

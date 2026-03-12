@@ -2,10 +2,12 @@
 pub struct BlockId(pub u16);
 
 impl BlockId {
-    pub const AIR: Self = Self(0);
-    pub const STONE: Self = Self(1);
-    pub const DIRT: Self = Self(2);
-    pub const GRASS: Self = Self(3);
+    pub const AIR:     Self = Self(0);
+    pub const STONE:   Self = Self(1);
+    pub const DIRT:    Self = Self(2);
+    pub const GRASS:   Self = Self(3);
+    pub const WATER:   Self = Self(4);
+    pub const BEDROCK: Self = Self(5);
 
     pub fn is_air(self) -> bool { self == Self::AIR }
 }

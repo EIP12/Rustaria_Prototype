@@ -21,8 +21,12 @@ A voxel engine written in Rust, rendering a procedurally generated 3D world usin
    - [Pipeline](#pipeline)
    - [Shader (WGSL)](#shader-wgsl)
    - [GPU Mesh](#gpu-mesh)
+   - [Frustum Culling](#frustum-culling)
    - [Debug Overlay](#debug-overlay)
-   - [App & GameState (main.rs)](#app--gamestate-mainrs)
+   - [App (main.rs)](#app-mainrs)
+   - [GameState](#gamestate)
+   - [Streaming](#streaming)
+   - [Render](#render)
 5. [Controls](#controls)
 6. [Build & Run](#build--run)
 7. [Data Flow](#data-flow)
@@ -41,21 +45,25 @@ rustaria/
 │       ├── block.rs                # Block types, IDs, registry
 │       ├── blocks/
 │       │   ├── mod.rs
-│       │   └── defaults.rs         # Default block registration (AIR, STONE, DIRT, GRASS)
+│       │   └── defaults.rs         # Default block registration (AIR, STONE, DIRT, GRASS, WATER, BEDROCK)
 │       ├── chunk.rs                # Chunk storage (Dense / Compressed stub)
-│       ├── mesh.rs                 # CPU-side mesh builder with neighbor culling
-│       ├── world.rs                # Procedural terrain generator (Perlin noise)
-│       └── world_manager.rs        # Chunk lifecycle & HashMap storage
+│       ├── mesh.rs                 # CPU-side mesh builder with neighbor culling + parallel meshing
+│       ├── world.rs                # Procedural terrain generator (Perlin noise, caves, water, bedrock)
+│       └── world_manager.rs        # Chunk lifecycle, HashMap storage, parallel generation
 └── rustaria-game/                  # Windowed application (wgpu + winit)
     ├── Cargo.toml
     └── src/
-        ├── main.rs                 # Entry point, App, GameState, event loop
+        ├── main.rs                 # Entry point, App, ApplicationHandler, event loop
+        ├── game_state.rs           # GameState struct definition and initialization
+        ├── streaming.rs            # Chunk streaming: load/unload, priority queue, budget
+        ├── render.rs               # Per-frame render loop (GameState::render)
         ├── renderer.rs             # wgpu device/surface/queue init
         ├── camera.rs               # FPS camera (yaw/pitch, mouse look, WASD)
         ├── input.rs                # Keyboard + mouse input state machine
         ├── pipeline.rs             # Render pipelines, uniforms, day/night cycle
+        ├── frustum.rs              # View-frustum culling for chunk draw calls
         ├── gpu_mesh.rs             # Per-chunk GPU buffer wrapper
-        ├── debug.rs                # Debug overlay (wireframe toggle)
+        ├── debug.rs                # Debug overlay (wireframe, chunk borders)
         └── shader.wgsl             # WGSL vertex + fragment shaders (diffuse + ambient)
 ```
 
@@ -71,6 +79,15 @@ The project is split into two crates with a strict separation of concerns:
 | `rustaria-game` | Rendering: wgpu pipeline, winit window, FPS camera, input, event loop | wgpu, winit |
 
 `rustaria-game` depends on `rustaria-core`. The core crate produces plain Rust data structures (`Vec<Vertex>`, `Vec<u32>`, `ChunkData`) that the game crate uploads to the GPU and renders.
+
+The game crate is split into focused modules:
+
+| Module | Responsibility |
+|---|---|
+| `main.rs` | App shell, winit event loop (~85 lines) |
+| `game_state.rs` | GameState struct + async initialization |
+| `streaming.rs` | Chunk streaming: priority queue, load/unload, parallel gen + mesh |
+| `render.rs` | Full per-frame render logic |
 
 ---
 
@@ -94,6 +111,8 @@ A newtype wrapper around `u16` identifying a block type. Predefined constants:
 | `BlockId::STONE` | 1 | Stone |
 | `BlockId::DIRT` | 2 | Dirt |
 | `BlockId::GRASS` | 3 | Grass |
+| `BlockId::WATER` | 4 | Water |
+| `BlockId::BEDROCK` | 5 | Bedrock (indestructible base layer) |
 
 `is_air()` returns `true` when the ID is `0`. The mesh builder uses this to skip rendering and face culling checks.
 
@@ -138,11 +157,9 @@ A flat `Vec`-based registry where the index equals `BlockId.0`. AIR **must** be 
 
 | Method | Description |
 |---|---|
-| `new()` | Creates a registry and calls `blocks::defaults::register_defaults` to populate AIR, STONE, DIRT, GRASS |
+| `new()` | Creates a registry and calls `blocks::defaults::register_defaults` to populate all default blocks |
 | `register(block)` | Appends a block and returns its `BlockId` |
 | `get(id)` | Returns `Option<&BlockType>` by ID |
-
-Default block registration is separated into `blocks/defaults.rs`, keeping the registry logic clean and making it easy to add new block sets later.
 
 ---
 
@@ -188,12 +205,8 @@ pub struct ChunkData {
 | `new(position)` | Creates an all-air chunk at the given chunk coordinate |
 | `get(x, y, z)` | Returns the `BlockId` at local coordinates `[0, CHUNK_SIZE)` |
 | `set(x, y, z, block)` | Sets a block and marks the chunk as dirty |
-| `generate_single_block_test()` | Creates a chunk with one STONE block at (0,0,0); legacy test |
-| `generate_flat_test()` | Creates a flat terrain layer: STONE at y=0, DIRT at y=1..3, GRASS at y=4; legacy test |
 
 **Index formula:** `index = x + y * CHUNK_SIZE + z * CHUNK_SIZE²`
-
-Note: The test generators (`generate_single_block_test`, `generate_flat_test`) are defined in `world.rs` as `impl ChunkData` blocks for backward compatibility. Active world generation uses `TerrainGenerator` instead.
 
 ---
 
@@ -261,9 +274,17 @@ Implements **culled meshing** with inter-chunk neighbor awareness:
    - 4 vertices with world-space position (chunk offset applied), block color, face normal, and AO = 1.0.
    - 6 indices forming two counter-clockwise triangles.
 
-Face definitions are stored in a const `FACES` array of `FaceDef` structs, each containing the neighbor direction, 4 corner offsets, and the face normal vector.
+#### `mesh_chunks_parallel`
 
-Unknown block IDs (not in registry) fall back to magenta `[1.0, 0.0, 1.0]` for easy visual debugging.
+```rust
+pub fn mesh_chunks_parallel(
+    positions: &[(i32, i32, i32)],
+    world: &WorldManager,
+    registry: &BlockRegistry,
+) -> Vec<((i32, i32, i32), Vec<Vertex>, Vec<u32>)>
+```
+
+Meshes multiple chunks in parallel using Rayon. Each chunk is meshed independently with its 6 neighbors fetched from the `WorldManager`. Returns a flat `Vec` of `(position, vertices, indices)` tuples. Unknown block IDs fall back to magenta `[1.0, 0.0, 1.0]` for visual debugging.
 
 ---
 
@@ -279,7 +300,7 @@ pub struct TerrainGenerator {
 }
 ```
 
-Procedural terrain generator using the `noise` crate's Perlin noise. Generates chunks independently from a 2D heightmap.
+Procedural terrain generator using the `noise` crate's Perlin noise.
 
 | Method | Description |
 |---|---|
@@ -291,21 +312,26 @@ Procedural terrain generator using the `noise` crate's Perlin noise. Generates c
 
 The height at each (x, z) column is computed from 4 layers of Perlin noise:
 
-1. **Continent mask** (scale 0.005): Low-frequency noise that determines plains vs mountains regions. Values below 0.4 produce flat plains, above 0.6 produce full mountains, with a smooth blend in between.
+1. **Continent mask** (scale 0.005): Low-frequency noise determining plains vs mountains regions. Values below 0.4 produce flat plains, above 0.6 produce full mountains, with a smooth blend in between.
 2. **3 octaves of detail noise** (scales 0.02, 0.05, 0.1): Combined with weights 1.0, 0.5, 0.25 and normalized to a 0..1 range.
 
-The continent blend interpolates between a narrow height range (plains: ~8–14 blocks) and the full range (mountains: 0–48 blocks).
+The continent blend interpolates between a narrow height range (plains) and the full range (mountains).
 
 #### Block placement
 
-For each column, blocks are placed based on distance from the surface:
+For each column, blocks are placed based on distance from the surface and world constants:
 
 | Condition | Block |
 |---|---|
+| `world_y > height` and `world_y <= SEA_LEVEL` | WATER (ocean fill) |
 | `world_y > height` | AIR |
-| `world_y == height` | GRASS |
+| `world_y == height` (above sea level) | GRASS |
+| `world_y == height` (at/below sea level) | DIRT (submerged surface) |
 | `world_y > height - 4` | DIRT |
-| `world_y <= height - 4` | STONE |
+| `world_y > BEDROCK_HEIGHT` | STONE |
+| `world_y <= BEDROCK_HEIGHT` | BEDROCK |
+
+Caves are carved using 3D Perlin noise: blocks below the terrain surface are removed when the cave noise value exceeds a threshold, creating connected underground voids.
 
 ---
 
@@ -322,17 +348,21 @@ pub struct WorldManager {
 }
 ```
 
-Manages chunk lifecycle: generation, storage, and neighbor dirty-flag propagation.
+Manages chunk lifecycle: generation, storage, dirty-flag propagation, and parallel bulk generation.
 
 | Method | Description |
 |---|---|
-| `new(seed)` | Creates a new world with a `TerrainGenerator` seeded from the given value |
-| `get_chunk(cx, cy, cz)` | Returns `Option<&ChunkData>` for the chunk at the given coordinates |
+| `new(seed)` | Creates a new world with a seeded `TerrainGenerator` |
+| `get_chunk(cx, cy, cz)` | Returns `Option<&ChunkData>` |
 | `has_chunk(cx, cy, cz)` | Returns whether the chunk is loaded |
-| `generate_chunk(cx, cy, cz)` | Generates the chunk, inserts it, and marks all 6 existing neighbors as dirty. Returns the list of dirty neighbor positions. |
+| `generate_chunk(cx, cy, cz)` | Generates and inserts one chunk, marks 6 neighbors dirty |
+| `generate_chunks_parallel(positions)` | Generates multiple chunks in parallel via Rayon, then inserts all and marks neighbors dirty |
+| `get_dirty_chunks()` | Returns all chunk positions currently marked dirty |
+| `clear_dirty(pos)` | Clears the dirty flag for a chunk after re-meshing |
+| `unload_chunk(cx, cy, cz)` | Removes a chunk from memory |
 | `chunk_count()` | Returns the number of loaded chunks |
 
-When a new chunk is generated, all 6 adjacent chunks (if they exist) are marked dirty so they can be re-meshed with correct inter-chunk face culling along the shared boundary.
+When a new chunk is generated, all 6 adjacent chunks (if loaded) are marked dirty so they can be re-meshed with correct inter-chunk face culling along the shared boundary.
 
 ---
 
@@ -365,9 +395,7 @@ Instance (selects backend: Vulkan / Metal / DX12)
                     └─> SurfaceConfiguration (sRGB format preferred, VSync/Fifo)
 ```
 
-The surface is **not configured** during `new()`. It is configured on the first `WindowEvent::Resized` event via `resize()`. This is required by the learn-wgpu pattern and avoids a race condition on some platforms.
-
-`wgpu::Features::POLYGON_MODE_LINE` is explicitly requested to support wireframe rendering.
+The surface is **not configured** during `new()`. It is configured on the first `WindowEvent::Resized` event via `resize()`. `wgpu::Features::POLYGON_MODE_LINE` is requested to support wireframe rendering.
 
 #### `resize(width, height)`
 
@@ -393,25 +421,11 @@ Uploaded to the GPU each frame as a uniform buffer at `@group(0) @binding(0)`.
 
 #### `Camera`
 
-```rust
-pub struct Camera {
-    pub position: glam::Vec3,
-    pub yaw: f32,   // radians
-    pub pitch: f32,  // radians
-    aspect: f32,
-    fov_y: f32,
-    near: f32,
-    far: f32,
-}
-```
-
 A free-look FPS camera controlled by keyboard (position) and mouse (orientation).
 
 | Parameter | Default value |
 |---|---|
-| Initial position | `(128.0, 60.0, 128.0)` — center of the 16×16 chunk world, above terrain |
-| Initial yaw | 180° (looking toward -X) |
-| Initial pitch | -20° (slightly looking down) |
+| Initial position | `(128.0, 60.0, 128.0)` |
 | FOV | 70° vertical |
 | Near / Far | 0.1 / 512.0 |
 | Move speed | 0.6 units/frame |
@@ -419,17 +433,11 @@ A free-look FPS camera controlled by keyboard (position) and mouse (orientation)
 
 | Method | Description |
 |---|---|
-| `new(width, height)` | Creates the camera with defaults and computes the aspect ratio |
+| `new(width, height)` | Creates the camera with defaults |
 | `resize(width, height)` | Updates the aspect ratio on window resize |
-| `forward()` | Computes the look direction vector from yaw and pitch |
-| `right()` | Computes the right vector (perpendicular to forward in the horizontal plane) |
-| `build_uniform()` | Builds the `CameraUniform` with `proj * view` using `glam::Mat4::look_at_rh` and `perspective_rh` |
-| `update(input)` | Applies WASD movement and mouse look from `InputState`. Pitch is clamped to ±89°. |
-| `upload(queue, buffer)` | Writes the current `view_proj` matrix to the GPU uniform buffer |
-
-#### `build_camera_buffer`
-
-Standalone function that creates the GPU uniform buffer (`UNIFORM | COPY_DST`) with initial camera data. The `COPY_DST` usage allows per-frame updates via `queue.write_buffer`.
+| `build_uniform()` | Builds the `CameraUniform` using `glam::Mat4::look_at_rh` and `perspective_rh` |
+| `update(input)` | Applies WASD movement and mouse look. Pitch clamped to ±89°. |
+| `upload(queue, buffer)` | Writes the current `view_proj` matrix to the GPU buffer |
 
 ---
 
@@ -456,17 +464,14 @@ pub struct InputState {
 }
 ```
 
-Holds the current state of all inputs. Movement keys are held-state booleans. Mouse deltas are accumulated between frames and reset to zero after each frame. `toggle_light` and `regen_world` are one-shot flags consumed once per frame.
-
-#### `handle_keyboard`
-
-Processes `WindowEvent` keyboard and mouse button events. Returns `true` if the event was consumed (closing, debug toggle, etc.).
+Movement keys are held-state booleans. Mouse deltas are accumulated between frames and reset to zero after each frame. `toggle_light` and `regen_world` are one-shot flags consumed once per frame.
 
 | Input | Action |
 |---|---|
 | Left click | Captures the mouse (enables mouse look) |
-| Escape | Releases the mouse if captured, otherwise exits the application |
+| Escape | Releases the mouse, or exits if already free |
 | G | Toggles wireframe debug mode |
+| B | Toggles chunk border debug overlay |
 | L | Sets `toggle_light` flag (day/night toggle) |
 | R | Sets `regen_world` flag (world regeneration) |
 | W/Z/↑ | Forward movement |
@@ -475,10 +480,6 @@ Processes `WindowEvent` keyboard and mouse button events. Returns `true` if the 
 | D/→ | Right movement |
 | Space | Move up |
 | Shift | Move down |
-
-#### `handle_device_event`
-
-Captures raw mouse delta from `DeviceEvent::MouseMotion`. Only accumulates when `mouse_captured` is true. Called from `ApplicationHandler::device_event` in `main.rs`.
 
 ---
 
@@ -490,15 +491,14 @@ Captures raw mouse delta from `DeviceEvent::MouseMotion`. Only accumulates when 
 
 ```rust
 pub struct PipelineBundle {
-    pub fill_pipeline:      wgpu::RenderPipeline,
-    pub wireframe_pipeline: wgpu::RenderPipeline,
-    pub camera_bind_group:  wgpu::BindGroup,
-    pub camera_buffer:      wgpu::Buffer,
-    pub light_buffer:       wgpu::Buffer,
+    pub fill_pipeline:         wgpu::RenderPipeline,
+    pub wireframe_pipeline:    wgpu::RenderPipeline,
+    pub chunk_border_pipeline: wgpu::RenderPipeline,
+    pub camera_bind_group:     wgpu::BindGroup,
+    pub camera_buffer:         wgpu::Buffer,
+    pub light_buffer:          wgpu::Buffer,
 }
 ```
-
-Groups all pipeline-related GPU resources returned by `create_pipeline`.
 
 #### Vertex buffer layout
 
@@ -511,48 +511,35 @@ Describes the `Vertex` struct to wgpu (stride = 40 bytes, 10 × f32):
 | normal | 2 | `Float32x3` | 24 bytes |
 | ao | 3 | `Float32` | 36 bytes |
 
-#### `create_pipeline` — dual pipeline
+#### Pipelines
 
-Returns two `wgpu::RenderPipeline` and the shared bind group with two uniform bindings:
+`create_pipeline` returns three `wgpu::RenderPipeline` sharing the same shader and bind group:
 
 | Pipeline | `PolygonMode` | Back-face culling | Usage |
 |---|---|---|---|
 | Fill | `Fill` | Enabled (`Back`) | Normal rendering |
 | Wireframe | `Line` | Disabled | Debug mode (key G) |
-
-Both pipelines share the same shader, bind group layout, and vertex buffer layout. Only `primitive.polygon_mode` and `primitive.cull_mode` differ.
-
-Depth testing is enabled on both pipelines: `CompareFunction::Less`, `Depth32Float` format.
+| Chunk border | `Line` | Disabled | Debug chunk boundary overlay (key B) |
 
 #### Bind group layout
 
 | Binding | Stage | Content |
 |---|---|---|
-| 0 | Vertex | `CameraUniform` — view_proj matrix (updated each frame) |
-| 1 | Fragment | `LightUniform` — sun direction, ambient, sun color (updated each frame) |
+| 0 | Vertex | `CameraUniform` — view_proj matrix |
+| 1 | Fragment | `LightUniform` — sun direction, ambient, sun color |
 
 #### Day/Night Cycle
 
-##### `day_night_light(time) -> [f32; 8]`
+`day_night_light(time)` computes the `LightUniform` for a time value in `[0.0, 1.0)`:
 
-Computes the `LightUniform` data for a given time in the day cycle:
-
-| Time value | Meaning |
+| Time | Meaning |
 |---|---|
 | 0.0 | Dawn |
-| 0.25 | Noon |
+| 0.25 | Noon (default) |
 | 0.5 | Dusk |
 | 0.75 | Midnight |
 
-The sun direction rotates in a circle (`cos`/`sin` of `time * TAU`). Ambient light, sun color warmth, and intensity are all derived from the sun's vertical position. At night, ambient drops to 0.03 and sun contribution fades to zero.
-
-##### `sky_color(time) -> wgpu::Color`
-
-Returns a clear color matching the day/night state. Transitions from deep navy at night to warm blue at noon, with a warm tint near dawn/dusk.
-
-#### `create_depth_texture_view`
-
-Creates a `Depth32Float` texture matching the surface dimensions. Must be recreated every time the window is resized.
+`sky_color(time)` returns a matching `wgpu::Color` for the render pass clear color.
 
 ---
 
@@ -560,30 +547,12 @@ Creates a `Depth32Float` texture matching the surface dimensions. Must be recrea
 
 **File:** `rustaria-game/src/shader.wgsl`
 
-```wgsl
-// Uniforms
-@group(0) @binding(0) var<uniform> camera: CameraUniform;  // view_proj matrix
-@group(0) @binding(1) var<uniform> light:  LightUniform;   // sun direction, ambient, sun color
+The vertex shader applies the MVP matrix. The fragment shader computes a simple directional light model:
 
-// Vertex shader: applies MVP transform, passes color/normal/ao to fragment
-@vertex fn vs_main(in: VertexInput) -> VertexOutput {
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.color  = in.color;
-    out.normal = in.normal;
-    out.ao     = in.ao;
-}
-
-// Fragment shader: diffuse + ambient lighting
-@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let ambient     = light.ambient;
-    let diffuse     = max(dot(in.normal, light.sun_dir), 0.0);
-    let light_total = ambient + diffuse * 0.8;
-    let final_color = in.color * light_total * in.ao;
-    return vec4<f32>(final_color, 1.0);
-}
 ```
-
-The vertex shader applies the MVP matrix and passes per-vertex attributes through. The fragment shader computes a simple directional light model: ambient light (constant base from `LightUniform`) plus diffuse contribution (dot product of face normal and sun direction, scaled by 0.8). The result is multiplied by vertex color and the AO factor.
+light_total = ambient + max(dot(normal, sun_dir), 0.0) * 0.8
+final_color = vertex_color * light_total * ao
+```
 
 ---
 
@@ -599,9 +568,19 @@ pub struct GpuMesh {
 }
 ```
 
-A lightweight wrapper that owns the GPU vertex and index buffers for a single chunk. Created by uploading the output of `mesh_chunk` via `wgpu::util::DeviceExt::create_buffer_init`.
+A lightweight wrapper owning the GPU vertex and index buffers for a single chunk. `GameState` stores these in a `HashMap<(i32, i32, i32), GpuMesh>`. Chunks with no visible faces are removed from the map.
 
-`GameState` stores these in a `HashMap<(i32, i32, i32), GpuMesh>` keyed by chunk coordinates. Chunks with no visible faces (empty mesh) are removed from the map.
+---
+
+### Frustum Culling
+
+**File:** `rustaria-game/src/frustum.rs`
+
+```rust
+pub struct Frustum { planes: [Vec4; 6] }
+```
+
+Extracts the 6 clip planes from the view-projection matrix each frame. Before issuing a draw call for a chunk mesh, `Frustum::contains_chunk(cx, cy, cz)` checks whether the chunk's AABB intersects the frustum. Chunks entirely outside are skipped, which dramatically reduces draw calls at high render distances.
 
 ---
 
@@ -611,109 +590,132 @@ A lightweight wrapper that owns the GPU vertex and index buffers for a single ch
 
 ```rust
 pub struct DebugOverlay {
-    pub wireframe: bool,
+    wireframe:     bool,
+    chunk_borders: bool,
 }
 ```
 
 | Method | Description |
 |---|---|
-| `new()` | Creates the overlay with wireframe disabled |
-| `toggle_wireframe()` | Flips the `wireframe` flag and logs the new state via `log::info!` |
+| `new()` | Creates the overlay with all flags disabled |
+| `toggle_wireframe()` | Flips the wireframe flag |
+| `toggle_chunk_borders()` | Flips the chunk border flag |
+| `show_wireframe()` | Read by the render loop to select the active pipeline |
+| `show_chunk_borders()` | Read by the render loop to draw chunk AABB lines |
 
-The `wireframe` flag is read each frame in `GameState::render()` to select between the fill pipeline and the wireframe pipeline.
-
-Designed to be extended with additional debug flags (e.g. `show_chunk_borders`, `show_normals`).
+When chunk borders are enabled, loaded chunks are outlined:
+- **Yellow** — chunk has a GPU mesh (contains visible blocks)
+- **Cyan** — chunk is loaded but produced no geometry (fully air or culled)
 
 ---
 
-### App & GameState (main.rs)
+### App (main.rs)
 
 **File:** `rustaria-game/src/main.rs`
 
-#### `App`
-
-Implements `winit::application::ApplicationHandler` (winit 0.30 pattern). Holds an `Option<GameState>` that is populated in `resumed()`.
+The entry point (~85 lines). Declares all modules and implements `winit::application::ApplicationHandler` for the `App` struct.
 
 #### World Constants
 
 ```rust
-const WORLD_CX: i32 = 16;  // 16 chunks along X
-const WORLD_CY: i32 = 4;   // 4 chunks along Y
-const WORLD_CZ: i32 = 16;  // 16 chunks along Z
-const CHUNKS_PER_FRAME: usize = 4;
+pub const RENDER_DISTANCE: i32 = 16;       // chunks in each horizontal direction
+pub const WORLD_HEIGHT: i32 = 3;           // cy range: -WORLD_DEPTH .. WORLD_HEIGHT
+pub const WORLD_DEPTH: i32 = 4;            // cy starts at -4 (world_y = -64)
+pub const GEN_BUDGET_PER_FRAME: usize = 32;
+pub const MESH_BUDGET_PER_FRAME: usize = 16;
 ```
 
-The world is a 16×4×16 grid of chunks (256×64×256 blocks). Chunks are generated progressively at 4 chunks per frame to avoid startup lag.
-
-#### `GameState`
-
-Owns all GPU resources, game data, and subsystems:
-
-```rust
-pub struct GameState {
-    renderer:           Renderer,
-    gpu_meshes:         HashMap<(i32, i32, i32), GpuMesh>,
-    render_pipeline:    wgpu::RenderPipeline,
-    wireframe_pipeline: wgpu::RenderPipeline,
-    camera:             Camera,
-    camera_buffer:      wgpu::Buffer,
-    camera_bind_group:  wgpu::BindGroup,
-    day_time:           f32,
-    is_night:           bool,
-    light_buffer:       wgpu::Buffer,
-    input:              InputState,
-    depth_texture_view: wgpu::TextureView,
-    debug:              DebugOverlay,
-    world:              WorldManager,
-    registry:           BlockRegistry,
-    pending_chunks:     Vec<(i32, i32, i32)>,
-}
-```
-
-#### Initialization (`GameState::new`)
-
-Runs asynchronously (required by wgpu's `request_adapter`), executed synchronously via `pollster::block_on`:
-
-1. Initialize `Renderer` (device, surface, queue).
-2. Build `BlockRegistry` with default blocks.
-3. Create `WorldManager` with a random seed (derived from system time).
-4. Build a sorted list of all chunk positions to load, sorted by distance to the camera's initial position (closest chunks are loaded first via `pop()`).
-5. Create render pipelines, uniform buffers, and bind group via `pipeline::create_pipeline`.
-6. Create the FPS `Camera` and depth buffer.
-
-#### Progressive Chunk Loading (`load_chunks`)
-
-Called every frame during `render()`. Each frame:
-
-1. Pop up to `CHUNKS_PER_FRAME` positions from `pending_chunks`.
-2. For each, call `world.generate_chunk()` which returns a list of dirty neighbors.
-3. Mesh the new chunk and all affected neighbors by calling `mesh_and_upload()`.
-
-`mesh_and_upload(cx, cy, cz)` retrieves the chunk and its 6 neighbors from the `WorldManager`, runs `mesh_chunk`, and either inserts the resulting `GpuMesh` into `gpu_meshes` or removes the entry if the mesh is empty.
-
-#### Render loop (`GameState::render`)
-
-1. Call `window.request_redraw()` to sustain continuous rendering.
-2. Guard: skip if surface is not yet configured.
-3. Run `load_chunks()` for progressive world loading.
-4. Handle one-shot inputs: `toggle_light` (L key) toggles `is_night` and sets `day_time` to 0.75 or 0.25. `regen_world` (R key) creates a new `WorldManager` with a fresh random seed, clears all GPU meshes, and re-queues all chunk positions.
-5. Update camera from input state, reset mouse deltas, upload camera uniform.
-6. Compute and upload light uniform from `day_time`.
-7. Acquire the next swapchain texture. On `Lost`/`Outdated` errors, reconfigure the surface and skip the frame.
-8. Begin a render pass with sky color from `sky_color(day_time)` and depth clear 1.0.
-9. Bind the active pipeline (fill or wireframe based on `debug.wireframe`).
-10. Iterate all `gpu_meshes` and `draw_indexed` each one.
-11. Submit commands and present.
-
-#### Event handling summary
+#### Event handling
 
 | Event | Action |
 |---|---|
+| `resumed` | Create window, init `GameState` via `pollster::block_on` |
 | `CloseRequested` | Exit event loop |
 | `Resized` | Resize surface + recreate depth buffer + update camera aspect ratio |
 | `RedrawRequested` | Call `state.render()` |
 | Keyboard/Mouse | Delegated to `input::handle_keyboard` |
 | `DeviceEvent` (mouse motion) | Delegated to `input::handle_device_event` |
+
+---
+
+### GameState
+
+**File:** `rustaria-game/src/game_state.rs`
+
+Owns all GPU resources, game data, and subsystems. Key fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `renderer` | `Renderer` | wgpu device/surface/queue |
+| `gpu_meshes` | `HashMap<(i32,i32,i32), GpuMesh>` | One entry per loaded chunk with geometry |
+| `render_pipeline` | `wgpu::RenderPipeline` | Normal fill rendering |
+| `wireframe_pipeline` | `wgpu::RenderPipeline` | Debug wireframe |
+| `chunk_border_pipeline` | `wgpu::RenderPipeline` | Debug chunk AABB lines |
+| `camera` | `Camera` | FPS camera |
+| `world` | `WorldManager` | Chunk storage + terrain generator |
+| `registry` | `BlockRegistry` | Block type lookup |
+| `pending_queue` | `VecDeque<(i32,i32,i32)>` | Ordered chunk load queue |
+| `loaded_chunks` | `HashSet<(i32,i32,i32)>` | Currently loaded chunk positions |
+| `last_cam_chunk` | `Option<(i32,i32,i32)>` | Last camera chunk position (for delta detection) |
+| `fps` | `f64` | Exponential moving average FPS |
+
+`GameState::new` is async (required by wgpu) and called synchronously via `pollster::block_on`.
+
+---
+
+### Streaming
+
+**File:** `rustaria-game/src/streaming.rs`
+
+Implements `GameState::update_streaming` and `GameState::load_chunks`, plus two helper functions.
+
+#### `update_streaming`
+
+Called at the start of each `load_chunks`. Runs only when the camera moves to a new chunk coordinate:
+
+1. Compute the desired chunk set: all `(cx, cy, cz)` within `RENDER_DISTANCE` horizontally and `WORLD_DEPTH..WORLD_HEIGHT` vertically.
+2. Unload chunks that fell outside the desired set (removes from `loaded_chunks`, `WorldManager`, and `gpu_meshes`).
+3. Sort new chunks by Manhattan distance from the camera chunk (closest first) and push into `pending_queue`.
+
+#### `load_chunks`
+
+Called every frame, budget-capped to limit frame time:
+
+1. Pop up to `GEN_BUDGET_PER_FRAME` positions from `pending_queue`.
+2. Generate them in parallel via `WorldManager::generate_chunks_parallel`.
+3. Build a mesh queue: all newly generated chunks + up to `MESH_BUDGET_PER_FRAME` additional dirty chunks (neighbor re-meshes).
+4. Mesh them in parallel via `mesh::mesh_chunks_parallel`.
+5. Upload results to GPU as `GpuMesh` entries. Chunks that produced no geometry are removed from `gpu_meshes`.
+
+#### Helper functions
+
+```rust
+pub fn camera_chunk_pos(camera: &Camera) -> (i32, i32, i32)
+pub fn compute_desired_set(cam_cx: i32, cam_cz: i32) -> HashSet<(i32, i32, i32)>
+```
+
+---
+
+### Render
+
+**File:** `rustaria-game/src/render.rs`
+
+Implements `GameState::render`, called every `WindowEvent::RedrawRequested`:
+
+1. `request_redraw()` to sustain continuous rendering.
+2. Update FPS counter (exponential moving average: 90% old + 10% new).
+3. Guard: skip if surface not yet configured.
+4. Call `load_chunks()` for progressive streaming.
+5. Handle one-shot inputs: `toggle_light` (L), `regen_world` (R — creates new `WorldManager`, clears all GPU state).
+6. Update camera from input, reset mouse deltas, upload camera uniform.
+7. Compute and upload light uniform from `day_time`.
+8. Acquire swapchain texture. On `Lost`/`Outdated`, reconfigure and skip frame.
+9. Begin render pass with `sky_color(day_time)` clear and depth clear 1.0.
+10. Build `Frustum` from current view-proj matrix.
+11. Iterate `gpu_meshes`, skip chunks failing frustum test, `draw_indexed` the rest.
+12. If chunk borders debug is enabled, emit line geometry for all loaded chunk AABBs.
+13. Update window title with FPS, position, and draw call counts.
+14. Submit command buffer and present.
 
 ---
 
@@ -730,6 +732,7 @@ Called every frame during `render()`. Each frame:
 | Mouse (when captured) | Look around (yaw/pitch) |
 | Left click | Capture mouse |
 | `G` | Toggle wireframe debug mode |
+| `B` | Toggle chunk border overlay |
 | `L` | Toggle day/night |
 | `R` | Regenerate world (new random seed) |
 | `Escape` | Release mouse, or quit if mouse is already free |
@@ -751,6 +754,12 @@ Enable logging:
 RUST_LOG=info cargo run -p rustaria-game
 ```
 
+Release build (recommended for performance):
+
+```bash
+cargo run -p rustaria-game --release
+```
+
 The world seed is logged at startup. Press `R` to regenerate with a new seed.
 
 ---
@@ -761,33 +770,31 @@ The world seed is logged at startup. Press `R` to regenerate with a new seed.
 WorldManager::new(seed)
   └─> TerrainGenerator::new(seed)
 
-Each frame (progressive loading):
-  pending_chunks.pop()              ← sorted closest-first
+Each frame (progressive streaming):
+  pending_queue.pop_front() × GEN_BUDGET     ← priority queue, closest first
         │
         ▼
-  TerrainGenerator::generate_chunk()
+  WorldManager::generate_chunks_parallel()   ← Rayon parallel generation
   → ChunkData (Dense, 4096 BlockIds)
+  → marks 6 neighbors dirty per new chunk
         │
         ▼
-  WorldManager inserts chunk
-  → marks 6 neighbors dirty
+  mesh::mesh_chunks_parallel()               ← Rayon parallel meshing
+  → Vec<Vertex>, Vec<u32>                       with inter-chunk culling
         │
         ▼
-  mesh_chunk(chunk, registry, neighbors)   ← rustaria-core (CPU only)
-  → Vec<Vertex>, Vec<u32>                     with inter-chunk culling
-        │
-        ▼
-  GpuMesh::new(device, vertices, indices)  ← wgpu upload to GPU VRAM
+  GpuMesh::new(device, vertices, indices)    ← wgpu upload to GPU VRAM
   → stored in HashMap<(i32,i32,i32), GpuMesh>
-        │
-        ▼
-  Every frame (render):
+
+Each frame (render):
+  Frustum::from_view_proj(view_proj)
   Camera::update(input) + upload()
   day_night_light(time) → light uniform
   get_current_texture()
   begin_render_pass(sky_color)
   set_pipeline()   ← fill or wireframe
   for each gpu_mesh:
-    draw_indexed()
+    if frustum.contains_chunk() → draw_indexed()
+  [optional] chunk border overlay lines
   submit() + present()
 ```
