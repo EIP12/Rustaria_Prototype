@@ -3,15 +3,47 @@ use noise::{NoiseFn, Perlin};
 use crate::block::BlockId;
 use crate::chunk::{ChunkData, CHUNK_SIZE};
 
+/// Lowest world Y coordinate (in blocks).
+pub const WORLD_Y_MIN: i32 = -50;
+/// Sea level Y coordinate — columns below this and above terrain get water.
+pub const SEA_LEVEL: i32 = 5;
+/// Bedrock occupies WORLD_Y_MIN..(WORLD_Y_MIN + BEDROCK_THICKNESS).
+pub const BEDROCK_THICKNESS: i32 = 3;
+
+const CAVE_SCALE: f64 = 0.05;
+const CAVE_DETAIL_SCALE: f64 = 0.10;
+const CAVE_THRESHOLD: f64 = 0.4;
+const SURFACE_MARGIN: i32 = 4;
+
 pub struct TerrainGenerator {
     perlin: Perlin,
+    cave_perlin: Perlin,
 }
 
 impl TerrainGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
             perlin: Perlin::new(seed),
+            cave_perlin: Perlin::new(seed.wrapping_add(12345)),
         }
+    }
+
+    /// Returns true if this voxel should be carved out as a cave.
+    fn is_cave(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        let x = world_x as f64;
+        let y = world_y as f64;
+        let z = world_z as f64;
+
+        let n1 = self.cave_perlin.get([x * CAVE_SCALE, y * CAVE_SCALE, z * CAVE_SCALE]);
+        let n2 = self.cave_perlin.get([
+            x * CAVE_DETAIL_SCALE + 100.0,
+            y * CAVE_DETAIL_SCALE + 100.0,
+            z * CAVE_DETAIL_SCALE + 100.0,
+        ]) * 0.5;
+
+        let combined = (n1 + n2) / 1.5; // roughly -1..1
+        let normalized = (combined + 1.0) / 2.0; // 0..1
+        normalized > CAVE_THRESHOLD
     }
 
     /// Returns terrain height (0..48) for the given world-space (x, z) column.
@@ -60,9 +92,27 @@ impl TerrainGenerator {
                 for ly in 0..CHUNK_SIZE {
                     let world_y = cy * CHUNK_SIZE as i32 + ly as i32;
 
-                    let block = if world_y > height {
-                        BlockId::AIR
-                    } else if world_y == height {
+                    // 1. Below world minimum → skip
+                    if world_y < WORLD_Y_MIN {
+                        continue;
+                    }
+
+                    // 2. Bedrock layer — always solid, never carved
+                    if world_y < WORLD_Y_MIN + BEDROCK_THICKNESS {
+                        chunk.set(lx, ly, lz, BlockId::BEDROCK);
+                        continue;
+                    }
+
+                    // 3. Above terrain surface
+                    if world_y > height {
+                        if world_y <= SEA_LEVEL {
+                            chunk.set(lx, ly, lz, BlockId::WATER);
+                        }
+                        continue;
+                    }
+
+                    // 4. Determine base terrain block
+                    let base_block = if world_y == height {
                         BlockId::GRASS
                     } else if world_y > height - 4 {
                         BlockId::DIRT
@@ -70,9 +120,16 @@ impl TerrainGenerator {
                         BlockId::STONE
                     };
 
-                    if !block.is_air() {
-                        chunk.set(lx, ly, lz, block);
+                    // 5. Cave carving — only below surface with margin, never in bedrock
+                    if world_y < height - SURFACE_MARGIN && self.is_cave(world_x, world_y, world_z) {
+                        if world_y <= SEA_LEVEL {
+                            chunk.set(lx, ly, lz, BlockId::WATER);
+                        }
+                        continue;
                     }
+
+                    // 6. Place terrain block
+                    chunk.set(lx, ly, lz, base_block);
                 }
             }
         }

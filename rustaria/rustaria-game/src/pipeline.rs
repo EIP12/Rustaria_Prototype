@@ -65,11 +65,12 @@ fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
 
 /// Regroupe tout ce que `create_pipeline` retourne.
 pub struct PipelineBundle {
-    pub fill_pipeline:      wgpu::RenderPipeline,
-    pub wireframe_pipeline: wgpu::RenderPipeline,
-    pub camera_bind_group:  wgpu::BindGroup,
-    pub camera_buffer:      wgpu::Buffer,
-    pub light_buffer:       wgpu::Buffer,
+    pub fill_pipeline:         wgpu::RenderPipeline,
+    pub wireframe_pipeline:    wgpu::RenderPipeline,
+    pub chunk_border_pipeline: wgpu::RenderPipeline,
+    pub camera_bind_group:     wgpu::BindGroup,
+    pub camera_buffer:         wgpu::Buffer,
+    pub light_buffer:          wgpu::Buffer,
 }
 
 /// Crée le pipeline de rendu, les buffers uniforms et le bind group.
@@ -169,7 +170,44 @@ pub fn create_pipeline(
     let fill_pipeline      = make_pipeline(wgpu::PolygonMode::Fill, "Fill Pipeline");
     let wireframe_pipeline = make_pipeline(wgpu::PolygonMode::Line, "Wireframe Pipeline");
 
-    PipelineBundle { fill_pipeline, wireframe_pipeline, camera_bind_group, camera_buffer, light_buffer }
+    // Chunk border pipeline: LineList topology, unlit fragment shader, no depth write
+    let chunk_border_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Chunk Border Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[vertex_buffer_layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_unlit",
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false, // borders don't occlude terrain
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    PipelineBundle { fill_pipeline, wireframe_pipeline, chunk_border_pipeline, camera_bind_group, camera_buffer, light_buffer }
 }
 
 /// Crée le depth buffer (Depth32Float), à recréer à chaque resize.

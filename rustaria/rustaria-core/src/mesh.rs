@@ -1,7 +1,10 @@
+use rayon::prelude::*;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::BlockRegistry;
 use crate::chunk::{ChunkData, CHUNK_SIZE};
+use crate::world_manager::WorldManager;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -14,6 +17,13 @@ pub struct Vertex {
 
 /// Optional neighbor chunk data for the 6 faces.
 /// Used for inter-chunk hidden-face culling.
+///
+/// `boundary_solid[i]` — if true, a missing neighbor in face direction `i`
+/// is treated as solid (face NOT emitted). Use this for world boundaries that
+/// will never have a chunk (e.g. -Y below cy=0). Default is false (safe
+/// default: missing neighbor → emit face so no holes appear during loading).
+///
+/// Face index mapping: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
 pub struct ChunkNeighbors<'a> {
     pub pos_x: Option<&'a ChunkData>, // +X neighbor
     pub neg_x: Option<&'a ChunkData>, // -X neighbor
@@ -21,6 +31,7 @@ pub struct ChunkNeighbors<'a> {
     pub neg_y: Option<&'a ChunkData>, // -Y neighbor
     pub pos_z: Option<&'a ChunkData>, // +Z neighbor
     pub neg_z: Option<&'a ChunkData>, // -Z neighbor
+    pub boundary_solid: [bool; 6],
 }
 
 impl<'a> ChunkNeighbors<'a> {
@@ -29,6 +40,7 @@ impl<'a> ChunkNeighbors<'a> {
             pos_x: None, neg_x: None,
             pos_y: None, neg_y: None,
             pos_z: None, neg_z: None,
+            boundary_solid: [false; 6],
         }
     }
 }
@@ -169,7 +181,8 @@ pub fn mesh_chunk(
                                 let lz = nz.rem_euclid(CHUNK_SIZE as i32) as usize;
                                 neighbor_chunk.get(lx, ly, lz).is_air()
                             }
-                            None => true, // No neighbor loaded — emit face (safe default)
+                            // No neighbor: solid boundary → don't emit; unloaded → emit (safe default)
+                            None => !neighbors.boundary_solid[face_idx],
                         }
                     };
 
@@ -197,4 +210,33 @@ pub fn mesh_chunk(
     }
 
     (vertices, indices)
+}
+
+/// Mesh multiple chunks in parallel via rayon.
+/// Returns only chunks that produced geometry (empty chunks are skipped).
+/// GPU upload must be done sequentially on the main thread afterwards.
+pub fn mesh_chunks_parallel(
+    positions: &[(i32, i32, i32)],
+    world: &WorldManager,
+    registry: &BlockRegistry,
+) -> Vec<((i32, i32, i32), Vec<Vertex>, Vec<u32>)> {
+    positions
+        .par_iter()
+        .filter_map(|&(cx, cy, cz)| {
+            let chunk = world.get_chunk(cx, cy, cz)?;
+            let mut boundary_solid = [false; 6];
+            boundary_solid[3] = cy == 0; // -Y: no chunk can ever exist below the world floor
+            let neighbors = ChunkNeighbors {
+                pos_x: world.get_chunk(cx + 1, cy, cz),
+                neg_x: world.get_chunk(cx - 1, cy, cz),
+                pos_y: world.get_chunk(cx, cy + 1, cz),
+                neg_y: world.get_chunk(cx, cy - 1, cz),
+                pos_z: world.get_chunk(cx, cy, cz + 1),
+                neg_z: world.get_chunk(cx, cy, cz - 1),
+                boundary_solid,
+            };
+            let (verts, idxs) = mesh_chunk(chunk, registry, &neighbors);
+            if idxs.is_empty() { None } else { Some(((cx, cy, cz), verts, idxs)) }
+        })
+        .collect()
 }
